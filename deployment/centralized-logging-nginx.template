@@ -1,0 +1,686 @@
+# Basic authentication instead of Cognito
+#
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >
+  Nginx stack is for provisioning all network resources and Nginx reverse proxy.
+
+Parameters:
+
+  # Cidr for VPC
+  Cidr4Vpc:
+    Description: CIDR for VPC.
+    Type: String
+    Default:  "10.0.0.0/16"
+  
+  #Cidr for Subnet
+  Cidr4Subnet:
+    Description: Comma-delimited list of CIDR blocks.
+    Type: CommaDelimitedList
+    Default: "10.0.10.0/24, 10.0.30.0/24, 10.0.60.0/22, 10.0.80.0/22"
+  
+  # Lastest version Amazon linux2 for Nginx instance
+  Ami:
+    Description: The Amazon Machine Image and the default value is latest version.
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  InstanceType:
+    Description: EC2 instance type to use for ECS cluster
+    Type: String
+    AllowedValues:
+      - c4.large
+      - c5.large
+      - m4.large
+      - r4.large
+      - r5.large
+    Default: c5.large
+  
+  # Keypair to access EC2
+  KeyPairName:
+    Description:  Key pair for ec2.
+    Type: String
+  
+  # Doamin name for Elasticsearch
+  ESDomain:
+    Description:  Domain name of ElasticSerach.
+    Type: String
+  
+  # Endpoint for Elasticsearch
+  ESDomainEndpoint:
+    Description:  Domain endpoint of ElasticSerach.
+    Type: String
+  
+  # User to access Kinbana
+  ProxyUsername:
+    Type: String
+    Description: User name for Kinbana access via the proxy server
+  
+  # Password to access Kinbana
+  ProxyPass:
+    NoEcho: 'true'
+    Description: Password for Kinbana access via the proxy server
+    Type: String
+    MinLength: '6'
+    MaxLength: '41'
+    AllowedPattern: '^(?=.*[0-9])(?=.*[a-z])(?=.*[A-Z]).{6,}$'
+    ConstraintDescription: >-
+      Must contain at least 1 Upper/Lower alphanumeric characters and number
+      (Mininum lenght is 6)
+  # Condition for China Region  
+  AtChinaRegion:
+    Description: Deploy the solution at China Region with specific adjustment.
+    Type: String
+    Default: 'Yes'
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+  
+  # Desired number of reverse proxy
+  DesiredCount:
+    Description: Desired number of reverse proxy.
+    Type: Number
+    Default: 1
+
+
+Conditions:
+  AtChina: !Equals [!Ref AtChinaRegion, 'Yes']
+
+Resources:
+  BaseVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref Cidr4Vpc
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+    Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W60
+              reason: "It'll be modified as per customer needs."
+
+  PublicSubnet1a:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: ""
+      CidrBlock: 
+        Fn::Select:
+          - 0
+          - !Ref Cidr4Subnet
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public1a'
+      VpcId:  !Ref BaseVPC
+    Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W33
+              reason: "The subnet is uesed to place public facing instance should be permitted."
+
+  PublicSubnet1b:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone:
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: ""
+      CidrBlock: 
+        Fn::Select:
+          - 1
+          - !Ref Cidr4Subnet
+      MapPublicIpOnLaunch: true      
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public1b'
+      VpcId:  !Ref BaseVPC
+    Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W33
+              reason: "The subnet is uesed to place public facing instance should be permitted."
+
+  VpcInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key:  Name
+          Value:  !Sub '${AWS::StackName}-igw'
+  AttachInternetGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:  !Ref BaseVPC
+      InternetGatewayId:  !Ref VpcInternetGateway
+
+  PublicRoutetable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+        - Key:  Name
+          Value:  !Sub '${AWS::StackName}-public-rt'
+      VpcId: !Ref BaseVPC
+
+  Route4PublicRoutetable:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref VpcInternetGateway
+      RouteTableId: !Ref PublicRoutetable
+
+
+  AssociationPublicSubnet1a:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRoutetable
+      SubnetId: !Ref PublicSubnet1a
+  AssociationPublicSubnet1b:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRoutetable
+      SubnetId: !Ref PublicSubnet1b
+
+
+  FleetLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+        AWS::CloudFormation::Init:
+          configSets:
+            Monitor_install:
+              - install_cfn
+              - install_nginx
+              - configure_nginx
+          install_cfn:
+            files:
+              /etc/cfn/cfn-hup.conf:
+                content: !Join 
+                  - ''
+                  - - |
+                      [main]
+                    - stack=
+                    - !Ref 'AWS::StackId'
+                    - |+
+
+                    - region=
+                    - !Ref 'AWS::Region'
+                    - |+
+
+                mode: '000400'
+                owner: root
+                group: root
+              /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+                content: !Join 
+                  - ''
+                  - - |
+                      [cfn-auto-reloader-hook]
+                    - |
+                      triggers=post.update
+                    - >
+                      path=Resources.FleetLaunchTemplate.Metadata.AWS::CloudFormation::Init
+                    - 'action=/opt/aws/bin/cfn-init -v '
+                    - '         --stack '
+                    - !Ref 'AWS::StackName'
+                    - '         --resource FleetLaunchTemplate '
+                    - '         --configsets Monitor_install '
+                    - '         --region '
+                    - !Ref 'AWS::Region'
+                    - |+
+
+                mode: '000400'
+                owner: root
+                group: root
+            services:
+              sysvinit:
+                cfn-hup:
+                  enabled: 'true'
+                  ensureRunning: 'true'
+                  files:
+                    - /etc/cfn/cfn-hup.conf
+                    - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+          install_nginx:
+            packages:
+              yum:
+                git: []
+            commands:
+              0-setup:
+                command: amazon-linux-extras install nginx1.12
+                cwd: /home/ec2-user
+            files:
+              /tmp/nginx.conf.tmp:
+                content: !Sub |
+                  user nginx;
+                  worker_processes auto;
+                  error_log /var/log/nginx/error.log;
+                  pid /run/nginx.pid;
+
+                  # Load dynamic modules. See /usr/share/nginx/README.dynamic.
+                  include /usr/share/nginx/modules/*.conf;
+
+                  events {
+                      worker_connections 1024;
+                  }
+
+                  http {
+                      log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+                                        '$status $body_bytes_sent "$http_referer" '
+                                        '"$http_user_agent" "$http_x_forwarded_for"';
+
+                      access_log  /var/log/nginx/access.log  main;
+
+                      sendfile            on;
+                      tcp_nopush          on;
+                      tcp_nodelay         on;
+                      keepalive_timeout   65;
+                      types_hash_max_size 2048;
+
+                      include             /etc/nginx/mime.types;
+                      default_type        application/octet-stream;
+
+                      include /etc/nginx/conf.d/*.conf;
+
+                      server {
+                        listen       443;
+                        server_name  $host;
+                        root         /usr/share/nginx/html;
+
+                        ssl_certificate "/etc/nginx/cert.crt";
+                        ssl_certificate_key "/etc/nginx/cert.key";
+
+                        ssl on;
+                        ssl_session_cache  builtin:1000  shared:SSL:10m;
+                        ssl_protocols  TLSv1 TLSv1.1 TLSv1.2;
+                        ssl_ciphers HIGH:!aNULL:!eNULL:!EXPORT:!CAMELLIA:!DES:!MD5:!PSK:!RC4;
+                        ssl_prefer_server_ciphers on;
+
+                        include /etc/nginx/default.d/*.conf;
+
+                        location / {
+                        }
+
+                        error_page 404 /404.html;
+                            location = /40x.html {
+                        }
+
+                        error_page 500 502 503 504 /50x.html;
+                            location = /50x.html {
+                        }
+                      }
+
+                  }
+
+                mode: '000700'
+                owner: root
+                group: root
+              
+              /tmp/setup.nginx:
+                content: !Sub | 
+                  nameserver=$(cat /etc/resolv.conf | grep -m1 nameserver | cut -d ' ' -f 2)
+                  sed -i 's/resolver-ip/'$nameserver'/g' /etc/nginx/default.d/default.conf
+                  
+                mode: '000700'
+                owner: root
+                group: root
+
+              /etc/nginx/default.d/default.conf:
+                content: !Sub |
+                  location ^~ /_plugin/kibana {
+
+                    resolver resolver-ip;
+                    auth_basic 'Restricted';
+                    auth_basic_user_file /etc/nginx/conf.d/kibana.htpasswd;
+
+                    # Forward requests to Kibana
+                    proxy_pass https://${ESDomainEndpoint}/_plugin/kibana;
+
+                    # Update cookie domain and path
+                    proxy_cookie_domain ${ESDomainEndpoint} $host;
+
+                    proxy_set_header Accept-Encoding "";
+
+                    proxy_set_header Authorization "";
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    proxy_set_header Host $host;
+                    proxy_cache_bypass $http_upgrade;
+                    proxy_set_header  X-Forwarded-For $proxy_add_x_forwarded_for;
+
+                    sub_filter_types *;
+                    sub_filter ${ESDomainEndpoint} $host;
+                    sub_filter_once off;
+
+                    # Response buffer settings
+                    proxy_buffer_size 128k;
+                    proxy_buffers 4 256k;
+                    proxy_busy_buffers_size 256k;
+                  }
+
+                mode: '000644'
+                owner: root
+                group: root
+    
+            services:
+              sysvinit:
+                nginx:
+                  enabled: 'true'
+          configure_nginx:
+            commands:
+              0-setup:
+                command: /tmp/setup.nginx
+                cwd: /home/ec2-user
+
+    Properties:
+      LaunchTemplateData: 
+        BlockDeviceMappings: 
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 40
+              DeleteOnTermination: true
+        EbsOptimized: false
+        IamInstanceProfile:
+          Arn: !GetAtt NginxInstanceProfile.Arn
+        ImageId: !Ref Ami
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        Monitoring: 
+          Enabled: true
+        SecurityGroupIds: 
+          - !GetAtt NginxSecurityGroup.GroupId
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash
+              set -e
+              yum update -y
+              yum install -y aws-cfn-bootstrap awscli jq wget 
+
+              /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource FleetLaunchTemplate \
+                --configsets Monitor_install --region ${AWS::Region}
+              /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource NginxAutoscalingGroup --region ${AWS::Region}
+
+              # Generate certificate for Nginx
+              openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+                -keyout /etc/nginx/cert.key -out /etc/nginx/cert.crt    \
+                -subj "/C=CN/ST=Denial/L=Springfield/O=Dis/CN=www.centralized-logging.com"
+
+              # Create a new username/password for nginx
+              echo ${ProxyUsername}:`openssl passwd -apr1 ${ProxyPass}` >> /etc/nginx/conf.d/kibana.htpasswd
+              
+              # Copy pre-baked nginx.conf
+              cp -f /tmp/nginx.conf.tmp /etc/nginx/nginx.conf
+              # Remove the default location from nginx config
+              sed -ri '/location \//,/.*\}/d' /etc/nginx/nginx.conf
+              service nginx restart
+
+              # Modify access policy for ElasticSearch
+              export NGINX_NODE_IPS=`aws ec2 describe-instances --region ${AWS::Region} --instance-ids \
+                $(aws autoscaling describe-auto-scaling-instances --region ${AWS::Region} --output text \
+                --query "AutoScalingInstances[?AutoScalingGroupName=='${AWS::StackName}-nginx-asg'].InstanceId") \
+                --query "Reservations[].Instances[].PublicIpAddress" |tr '\n' ' '`
+              export NEW_POLICY=$(aws es describe-elasticsearch-domain-config --region ${AWS::Region} \
+                --domain-name ${ESDomain} |\
+                jq '.DomainConfig.AccessPolicies.Options' |\
+                sed -e 's/\\//g;s/^"//;s/"$//'|sed -e 's/"aws:SourceIp".*}}}/"aws:SourceIp":'"$NGINX_NODE_IPS"'}}}/g')
+              aws es update-elasticsearch-domain-config --region ${AWS::Region} --domain-name ${ESDomain} \
+                --access-policies "$NEW_POLICY"
+              
+      LaunchTemplateName: !Sub '${AWS::StackName}-fleet-template'
+
+  NginxInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref NginxNodeRole
+
+  NginxNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            AWS: !Ref AWS::AccountId
+            Service: 
+              !If 
+                - AtChina
+                - "ec2.amazonaws.com.cn"
+                - "ec2.amazonaws.com"
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+
+  NginxNodePolicies:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-nginxnode-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+            - "es:*"
+          Resource: 
+            !If
+              - AtChina
+              - !Sub 'arn:aws-cn:es:${AWS::Region}:${AWS::AccountId}:domain/*'
+              - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/*'
+        - Effect: Allow
+          Action:
+            - "ec2:DescribeInstances"
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - "autoscaling:DescribeAutoScalingGroups"
+            - "autoscaling:DescribeAutoScalingInstances"
+          Resource: "*"
+      Roles:
+        - !Ref NginxNodeRole
+    Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: F4
+              reason: "All actions are under ElasticSearch should be permitted."
+            - id: W12
+              reason: "The actions in your policy do not support resource-level permissions and require you to choose All resources."
+
+  NginxAutoscalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:  
+      - AppsvrElasticLoadBalancing
+      - FleetLaunchTemplate
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-nginx-asg'
+      AvailabilityZones:
+        -
+          !Select
+            - 0
+            - Fn::GetAZs: ""
+        -
+          !Select
+            - 1
+            - Fn::GetAZs: ""
+      Cooldown: 180 #in seconds
+      DesiredCapacity: !Ref DesiredCount
+      # HealthCheckGracePeriod: Integer     #in seconds
+      HealthCheckType: EC2
+      TargetGroupARNs:
+        -
+          !Ref NginxElbTargetGroup
+      MaxSize: 4
+      MinSize: !Ref DesiredCount
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          #OnDemandAllocationStrategy: prioritized #only valid value is prioritized
+          OnDemandBaseCapacity: 1
+          OnDemandPercentageAboveBaseCapacity: 50
+          SpotAllocationStrategy: lowest-price #only valid value is lowest-price
+          SpotInstancePools: 2
+          #SpotMaxPrice: String #maximum Spot price is set at the On-Demand price
+        LaunchTemplate: 
+          LaunchTemplateSpecification: 
+            LaunchTemplateId: !Ref FleetLaunchTemplate
+            Version: !GetAtt FleetLaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: c5.large
+            - InstanceType: c4.large
+            - InstanceType: m4.large
+            - InstanceType: r5.large
+            - InstanceType: r4.large
+      MetricsCollection:
+        -
+          Granularity: "1Minute"
+          Metrics:
+            - "GroupMinSize"
+            - "GroupMaxSize"
+            - "GroupDesiredCapacity"
+            - "GroupInServiceInstances"
+            - "GroupPendingInstances"
+            - "GroupStandbyInstances"
+            - "GroupTerminatingInstances"
+            - "GroupTotalInstances"
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nginx-node'
+          PropagateAtLaunch: true
+        - Key: MemberOf
+          Value: !Sub '${AWS::StackName}-nginx-asg'
+          PropagateAtLaunch: true
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet1a
+        - !Ref PublicSubnet1b
+    UpdatePolicy:
+        AutoScalingScheduledAction:
+          IgnoreUnmodifiedGroupSizeProperties: 'true'
+        AutoScalingRollingUpdate:
+          MinInstancesInService: '1'
+          MaxBatchSize: '1'
+          WaitOnResourceSignals: 'true'
+          MinSuccessfulInstancesPercent: 100
+          # PauseTime: PT15M
+    CreationPolicy:
+      ResourceSignal:
+        Count:  !Ref DesiredCount
+        Timeout: PT15M
+
+  AppsvrElasticLoadBalancing:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Type: network
+      Scheme: internet-facing
+      # SecurityGroups:
+      #   - !Ref ELBSecurityGroup
+      Subnets:
+          - !Ref PublicSubnet1a
+          - !Ref PublicSubnet1b
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-internet-nlb'
+    Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W52
+              reason: "Access log will be open later stage."
+              
+  AppsvrElasticLoadBalancingListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          !Ref NginxElbTargetGroup
+      LoadBalancerArn:
+        !Ref AppsvrElasticLoadBalancing
+      Port: 443
+      Protocol: TCP
+
+  NginxElbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPort: traffic-port
+      HealthCheckProtocol: HTTPS
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 3
+      HealthCheckPath: /
+      Port: 443
+      Protocol: TCP
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-nlb-tg'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value:  20
+      TargetType: instance
+      VpcId: !Ref BaseVPC
+
+  NginxSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Allow https and ssh ports.'
+      VpcId: !Ref BaseVPC
+      SecurityGroupIngress:
+      #ssh
+        -
+          IpProtocol: TCP
+          FromPort: 22
+          ToPort: 22
+          CidrIp: '0.0.0.0/0'
+      #https
+        -
+          IpProtocol: TCP
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-node-sg'
+    Metadata:
+        cfn_nag:
+          rules_to_suppress:
+            - id: W9
+              reason: "This is a public facing instance and ingress from the internet should be permitted."
+            - id: W2
+              reason: "This is a public facing instance and ingress from the internet should be permitted."
+            - id: F1000
+              reason: "Override the SecurityGroup, egress rule defined as well."
+            - id: W36
+              reason: "Override the SecurityGroup."
+
+  # ELBSecurityGroup:
+  #   Type: AWS::EC2::SecurityGroup
+  #   Properties:
+  #     GroupDescription: Allow tcp to shost
+  #     VpcId: !Ref BaseVPC
+  #     SecurityGroupIngress:
+  #     -
+  #       IpProtocol: TCP
+  #       FromPort: '443'
+  #       ToPort: '443'
+  #       CidrIp: 0.0.0.0/0
+  #     Tags:
+  #       - Key: Name
+  #         Value: !Sub '${AWS::StackName}-elb-sg'
+
+Outputs:
+  baseVpc:
+    Description: VPC Stack ID.
+    Value:  !Ref BaseVPC
+  publicSubnet1a:
+    Description: Public subnet 1a.
+    Value:  !Ref PublicSubnet1a
+  publicSubnet1b:
+    Description: Public subnet 1b.
+    Value:  !Ref PublicSubnet1b
+  NlbDomainName:
+    Description: DNS of network load balancer
+    Value: !GetAtt AppsvrElasticLoadBalancing.DNSName
+
+
